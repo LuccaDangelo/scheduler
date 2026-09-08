@@ -192,7 +192,76 @@ int validate_tasks(const Task *tasks, int n_tasks)
  * POLITICA
  * ====================================================================== */
 
-/* Selecao da proxima tarefa segundo rate-monotonic / EDF. */
+/* Selecao da proxima tarefa segundo rate-monotonic / EDF.
+ *
+ * Retorna 1 se a tarefa 'a' tem prioridade maior que a tarefa 'b'.
+ * O desempate, em qualquer politica, e sempre pela ordem de aparicao no
+ * arquivo de entrada: vence o menor campo 'order'. */
+static int higher_priority(const Task *tasks, const TaskState *states,
+                           int a, int b, Policy policy)
+{
+    (void)states;
+
+    switch (policy) {
+    case POLICY_EDF:
+        /* TODO: proximo commit; por ora cai no mesmo caminho do rate. */
+    case POLICY_RATE:
+    default:
+        if (tasks[a].period != tasks[b].period)
+            return tasks[a].period < tasks[b].period;
+        break;
+    }
+
+    return tasks[a].order < tasks[b].order;
+}
+
+/* Indice da tarefa pronta de maior prioridade, ou -1 se nenhuma esta ativa. */
+static int pick_task(const Task *tasks, const TaskState *states, int n_tasks,
+                     Policy policy)
+{
+    int best = -1;
+    int i;
+
+    for (i = 0; i < n_tasks; i++) {
+        if (!states[i].active)
+            continue;
+        if (best < 0 || higher_priority(tasks, states, i, best, policy))
+            best = i;
+    }
+    return best;
+}
+
+/* ======================================================================
+ * TRACO
+ * ====================================================================== */
+
+/* Consolidacao dos segmentos de execucao.
+ *
+ * Um segmento permanece aberto enquanto a mesma tarefa (ou o ocioso) ocupa
+ * unidades de tempo contiguas; so no instante em que ele encerra e que se
+ * conhece a sua tag. 'open' vale SEG_NONE quando nao ha segmento aberto,
+ * SEG_IDLE para um segmento ocioso, e o indice da tarefa caso contrario. */
+#define SEG_NONE (-2)
+#define SEG_IDLE (-1)
+
+/* Fecha o segmento aberto com a tag informada e o acrescenta ao traco. */
+static void close_segment(Segment *trace, int *n_segments, int *open,
+                          int *length, char tag)
+{
+    if (*open == SEG_NONE)
+        return;
+
+    if (*n_segments >= MAX_SEGMENTS)
+        fail("erro: traco de execucao excede o numero maximo de segmentos");
+
+    trace[*n_segments].task   = *open;
+    trace[*n_segments].length = *length;
+    trace[*n_segments].tag    = (*open == SEG_IDLE) ? 0 : tag;
+    (*n_segments)++;
+
+    *open   = SEG_NONE;
+    *length = 0;
+}
 
 /* ======================================================================
  * MOTOR DE SIMULACAO
@@ -202,34 +271,140 @@ void run_simulation(const Task *tasks, int n_tasks, int total_time,
                     Policy policy, Segment *trace, int *n_segments,
                     TaskState *states)
 {
-    (void)tasks;
-    (void)n_tasks;
-    (void)total_time;
-    (void)policy;
-    (void)trace;
-    (void)n_segments;
-    (void)states;
+    int open   = SEG_NONE;   /* segmento em construcao */
+    int length = 0;          /* duracao acumulada do segmento aberto */
+    int t;
+    int i;
+
+    for (i = 0; i < n_tasks; i++) {
+        states[i].remaining    = 0;
+        states[i].abs_deadline = 0;
+        states[i].active       = 0;
+        states[i].lost         = 0;
+        states[i].complete     = 0;
+        states[i].killed       = 0;
+    }
+    *n_segments = 0;
+
+    for (t = 0; t < total_time; t++) {
+        int chosen;
+
+        /* 1. chegadas: a nova instancia substitui a anterior, se houver */
+        for (i = 0; i < n_tasks; i++) {
+            if (t % tasks[i].period == 0) {
+                states[i].remaining    = tasks[i].burst;
+                states[i].abs_deadline = t + tasks[i].deadline;
+                states[i].active       = 1;
+            }
+        }
+
+        /* 2. deadlines vencidos: a rajada restante e descartada e a tarefa
+         *    so volta a concorrer na proxima chegada */
+        for (i = 0; i < n_tasks; i++) {
+            if (states[i].active && states[i].abs_deadline == t) {
+                states[i].active = 0;
+                states[i].lost++;
+                if (open == i)
+                    close_segment(trace, n_segments, &open, &length, 'L');
+            }
+        }
+
+        /* 3. escolha refeita a cada tick: e o que implementa a preempcao */
+        chosen = pick_task(tasks, states, n_tasks, policy);
+
+        if (open != SEG_NONE && open != chosen)
+            close_segment(trace, n_segments, &open, &length, 'H');
+
+        if (open == SEG_NONE) {
+            open   = chosen;   /* 5. chosen == -1 abre um segmento ocioso */
+            length = 0;
+        }
+        length++;
+
+        /* 4. execucao de uma unidade de tempo */
+        if (chosen >= 0 && --states[chosen].remaining == 0) {
+            states[chosen].active = 0;
+            states[chosen].complete++;
+            close_segment(trace, n_segments, &open, &length, 'F');
+        }
+    }
+
+    /* o ultimo segmento nao encerra por nenhum dos tres eventos: fica sem tag */
+    close_segment(trace, n_segments, &open, &length, 0);
+
+    /* instancias ainda pendentes nao terminaram nem perderam o deadline */
+    for (i = 0; i < n_tasks; i++) {
+        if (states[i].active) {
+            states[i].active = 0;
+            states[i].killed++;
+        }
+    }
 }
-
-/* ======================================================================
- * TRACO
- * ====================================================================== */
-
-/* Consolidacao dos segmentos de execucao. */
 
 /* ======================================================================
  * RELATORIO
  * ====================================================================== */
 
+/* Contador da tarefa correspondente a uma das tres secoes do relatorio. */
+static int counter_of(const TaskState *state, int section)
+{
+    switch (section) {
+    case 0:  return state->lost;
+    case 1:  return state->complete;
+    default: return state->killed;
+    }
+}
+
+/* Escreve uma secao de contadores, na ordem de aparicao no arquivo de entrada. */
+static void write_counters(FILE *f, const char *title, const Task *tasks,
+                           int n_tasks, const TaskState *states, int section)
+{
+    int i;
+
+    fprintf(f, "\n%s\n", title);
+    for (i = 0; i < n_tasks; i++)
+        fprintf(f, "[%s] %d\n", tasks[i].name, counter_of(&states[i], section));
+}
+
 int write_report(Policy policy, const Task *tasks, int n_tasks,
                  const Segment *trace, int n_segments, const TaskState *states)
 {
-    (void)policy;
-    (void)tasks;
-    (void)n_tasks;
-    (void)trace;
-    (void)n_segments;
-    (void)states;
+    char msg[MSG_BUF];
+    char path[MAX_NAME];
+    FILE *f;
+    int i;
+
+    snprintf(path, sizeof path, "%s_%s.out",
+             (policy == POLICY_EDF) ? "edf" : "rate", OUT_SUFFIX);
+
+    f = fopen(path, "w");
+    if (f == NULL) {
+        snprintf(msg, sizeof msg,
+                 "erro: nao foi possivel escrever o arquivo '%s'", path);
+        fail(msg);
+    }
+
+    fprintf(f, "EXECUTION BY %s\n\n", (policy == POLICY_EDF) ? "EDF" : "RATE");
+
+    for (i = 0; i < n_segments; i++) {
+        if (trace[i].task < 0)
+            fprintf(f, "idle for %d units\n", trace[i].length);
+        else if (trace[i].tag != 0)
+            fprintf(f, "[%s] for %d units - %c\n",
+                    tasks[trace[i].task].name, trace[i].length, trace[i].tag);
+        else
+            fprintf(f, "[%s] for %d units\n",
+                    tasks[trace[i].task].name, trace[i].length);
+    }
+
+    write_counters(f, "LOST DEADLINES", tasks, n_tasks, states, 0);
+    write_counters(f, "COMPLETE EXECUTION", tasks, n_tasks, states, 1);
+    write_counters(f, "KILLED", tasks, n_tasks, states, 2);
+
+    if (fclose(f) != 0) {
+        snprintf(msg, sizeof msg, "erro: falha ao escrever o arquivo '%s'", path);
+        fail(msg);
+    }
     return 0;
 }
 
@@ -247,9 +422,12 @@ int main(int argc, char *argv[])
 {
     char msg[MSG_BUF];
     Task tasks[MAX_TASKS];
+    TaskState states[MAX_TASKS];
+    static Segment trace[MAX_SEGMENTS];
     Policy policy;
     int n_tasks = 0;
     int total_time = 0;
+    int n_segments = 0;
 
     if (argc != 3)
         fail("erro: uso: ./scheduler <rate|edf> <arquivo>");
@@ -269,8 +447,9 @@ int main(int argc, char *argv[])
     parse_input(argv[2], tasks, &n_tasks, &total_time);
     validate_tasks(tasks, n_tasks);
 
-    (void)policy;
-    /* TODO: commits seguintes */
+    run_simulation(tasks, n_tasks, total_time, policy, trace, &n_segments,
+                   states);
+    write_report(policy, tasks, n_tasks, trace, n_segments, states);
 
     return 0;
 }
