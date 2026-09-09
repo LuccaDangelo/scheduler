@@ -9,11 +9,6 @@
 #define LINE_BUF 512
 #define MSG_BUF  256
 
-/* ======================================================================
- * PARSING
- * ====================================================================== */
-
-/* 1 se a linha e vazia ou composta apenas de espacos em branco. */
 static int is_blank(const char *line)
 {
     for (; *line != '\0'; line++) {
@@ -23,7 +18,6 @@ static int is_blank(const char *line)
     return 1;
 }
 
-/* Converte um token em inteiro positivo; encerra o programa em caso de erro. */
 static int parse_positive_int(const char *tok, int line)
 {
     char msg[MSG_BUF];
@@ -85,7 +79,6 @@ int parse_input(const char *path, Task *tasks, int *n_tasks, int *total_time)
             continue;
 
         if (!have_total) {
-            /* primeira linha util: tempo total da simulacao */
             tok = strtok(line, " \t\r\n");
             if (tok == NULL || strtok(NULL, " \t\r\n") != NULL) {
                 fclose(f);
@@ -99,7 +92,6 @@ int parse_input(const char *path, Task *tasks, int *n_tasks, int *total_time)
             continue;
         }
 
-        /* linha de tarefa: NOME PERIODO DEADLINE BURST */
         for (tok = strtok(line, " \t\r\n"); tok != NULL;
              tok = strtok(NULL, " \t\r\n")) {
             if (n_fields < 5)
@@ -162,10 +154,6 @@ int parse_input(const char *path, Task *tasks, int *n_tasks, int *total_time)
     return 0;
 }
 
-/* ======================================================================
- * VALIDACAO
- * ====================================================================== */
-
 int validate_tasks(const Task *tasks, int n_tasks)
 {
     char msg[MSG_BUF];
@@ -188,22 +176,11 @@ int validate_tasks(const Task *tasks, int n_tasks)
     return 0;
 }
 
-/* ======================================================================
- * POLITICA
- * ====================================================================== */
-
-/* Selecao da proxima tarefa segundo rate-monotonic / EDF.
- *
- * Retorna 1 se a tarefa 'a' tem prioridade maior que a tarefa 'b'.
- * O desempate, em qualquer politica, e sempre pela ordem de aparicao no
- * arquivo de entrada: vence o menor campo 'order'. */
 static int higher_priority(const Task *tasks, const TaskState *states,
                            int a, int b, Policy policy)
 {
     switch (policy) {
     case POLICY_EDF:
-        /* so ha deadline absoluto valido em instancia ativa; pick_task() so
-         * compara tarefas ativas, mas nao dependemos disso aqui */
         if (states[a].active != states[b].active)
             return states[a].active;
         if (states[a].active && states[a].abs_deadline != states[b].abs_deadline)
@@ -220,7 +197,6 @@ static int higher_priority(const Task *tasks, const TaskState *states,
     return tasks[a].order < tasks[b].order;
 }
 
-/* Indice da tarefa pronta de maior prioridade, ou -1 se nenhuma esta ativa. */
 static int pick_task(const Task *tasks, const TaskState *states, int n_tasks,
                      Policy policy)
 {
@@ -236,20 +212,9 @@ static int pick_task(const Task *tasks, const TaskState *states, int n_tasks,
     return best;
 }
 
-/* ======================================================================
- * TRACO
- * ====================================================================== */
-
-/* Consolidacao dos segmentos de execucao.
- *
- * Um segmento permanece aberto enquanto a mesma tarefa (ou o ocioso) ocupa
- * unidades de tempo contiguas; so no instante em que ele encerra e que se
- * conhece a sua tag. 'open' vale SEG_NONE quando nao ha segmento aberto,
- * SEG_IDLE para um segmento ocioso, e o indice da tarefa caso contrario. */
 #define SEG_NONE (-2)
 #define SEG_IDLE (-1)
 
-/* Fecha o segmento aberto com a tag informada e o acrescenta ao traco. */
 static void close_segment(Segment *trace, int *n_segments, int *open,
                           int *length, char tag)
 {
@@ -268,16 +233,12 @@ static void close_segment(Segment *trace, int *n_segments, int *open,
     *length = 0;
 }
 
-/* ======================================================================
- * MOTOR DE SIMULACAO
- * ====================================================================== */
-
 void run_simulation(const Task *tasks, int n_tasks, int total_time,
                     Policy policy, Segment *trace, int *n_segments,
                     TaskState *states)
 {
-    int open   = SEG_NONE;   /* segmento em construcao */
-    int length = 0;          /* duracao acumulada do segmento aberto */
+    int open   = SEG_NONE;
+    int length = 0;
     int t;
     int i;
 
@@ -294,7 +255,6 @@ void run_simulation(const Task *tasks, int n_tasks, int total_time,
     for (t = 0; t < total_time; t++) {
         int chosen;
 
-        /* 1. chegadas: a nova instancia substitui a anterior, se houver */
         for (i = 0; i < n_tasks; i++) {
             if (t % tasks[i].period == 0) {
                 states[i].remaining    = tasks[i].burst;
@@ -303,8 +263,6 @@ void run_simulation(const Task *tasks, int n_tasks, int total_time,
             }
         }
 
-        /* 2. deadlines vencidos: a rajada restante e descartada e a tarefa
-         *    so volta a concorrer na proxima chegada */
         for (i = 0; i < n_tasks; i++) {
             if (states[i].active && states[i].abs_deadline == t) {
                 states[i].active = 0;
@@ -314,19 +272,17 @@ void run_simulation(const Task *tasks, int n_tasks, int total_time,
             }
         }
 
-        /* 3. escolha refeita a cada tick: e o que implementa a preempcao */
         chosen = pick_task(tasks, states, n_tasks, policy);
 
         if (open != SEG_NONE && open != chosen)
             close_segment(trace, n_segments, &open, &length, 'H');
 
         if (open == SEG_NONE) {
-            open   = chosen;   /* 5. chosen == -1 abre um segmento ocioso */
+            open   = chosen;
             length = 0;
         }
         length++;
 
-        /* 4. execucao de uma unidade de tempo */
         if (chosen >= 0 && --states[chosen].remaining == 0) {
             states[chosen].active = 0;
             states[chosen].complete++;
@@ -334,10 +290,8 @@ void run_simulation(const Task *tasks, int n_tasks, int total_time,
         }
     }
 
-    /* o ultimo segmento nao encerra por nenhum dos tres eventos: fica sem tag */
     close_segment(trace, n_segments, &open, &length, 0);
 
-    /* instancias ainda pendentes nao terminaram nem perderam o deadline */
     for (i = 0; i < n_tasks; i++) {
         if (states[i].active) {
             states[i].active = 0;
@@ -346,11 +300,6 @@ void run_simulation(const Task *tasks, int n_tasks, int total_time,
     }
 }
 
-/* ======================================================================
- * RELATORIO
- * ====================================================================== */
-
-/* Contador da tarefa correspondente a uma das tres secoes do relatorio. */
 static int counter_of(const TaskState *state, int section)
 {
     switch (section) {
@@ -360,7 +309,6 @@ static int counter_of(const TaskState *state, int section)
     }
 }
 
-/* Escreve uma secao de contadores, na ordem de aparicao no arquivo de entrada. */
 static void write_counters(FILE *f, const char *title, const Task *tasks,
                            int n_tasks, const TaskState *states, int section)
 {
@@ -419,10 +367,6 @@ void fail(const char *msg)
     exit(1);
 }
 
-/* ======================================================================
- * MAIN
- * ====================================================================== */
-
 int main(int argc, char *argv[])
 {
     char msg[MSG_BUF];
@@ -446,7 +390,7 @@ int main(int argc, char *argv[])
                  "erro: algoritmo invalido: '%s' (esperado 'rate' ou 'edf')",
                  argv[1]);
         fail(msg);
-        return 1; /* nao alcancado: fail() encerra o programa */
+        return 1;
     }
 
     parse_input(argv[2], tasks, &n_tasks, &total_time);
