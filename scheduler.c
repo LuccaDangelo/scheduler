@@ -200,11 +200,16 @@ int validate_tasks(const Task *tasks, int n_tasks)
 static int higher_priority(const Task *tasks, const TaskState *states,
                            int a, int b, Policy policy)
 {
-    (void)states;
-
     switch (policy) {
     case POLICY_EDF:
-        /* TODO: proximo commit; por ora cai no mesmo caminho do rate. */
+        /* so ha deadline absoluto valido em instancia ativa; pick_task() so
+         * compara tarefas ativas, mas nao dependemos disso aqui */
+        if (states[a].active != states[b].active)
+            return states[a].active;
+        if (states[a].active && states[a].abs_deadline != states[b].abs_deadline)
+            return states[a].abs_deadline < states[b].abs_deadline;
+        break;
+
     case POLICY_RATE:
     default:
         if (tasks[a].period != tasks[b].period)
